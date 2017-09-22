@@ -7,10 +7,10 @@ import threading
 import os
 import numpy as np
 
-SAVE_DIRECTORY = 'jun_aug_17_data'  # directory where data should be saved, saved in paris of [bid, ask]
+SAVE_DIRECTORY = None  # directory where data should be saved, leave None to auto-fill
 MARKETS = []  # leave empty to pull data for all BTC markets, otherwise provide e.g. ['BTC_XMR', 'BTC_LTC'...]
-START = '01/06/2017'  # d/m/y get data from
-END = '28/09/2017'  # to
+START = '21/08/2017'  # d/m/y get data from
+END = '21/09/2017'  # to
 PERIOD = 60  # time period in seconds to take average bid/ask over
 
 BASE_URL = 'https://poloniex.com/public?command=returnTradeHistory&currencyPair={}&start={}&end={}'
@@ -26,6 +26,9 @@ class Collector:
         self.num_markets = len(self.markets)
         self.download_logs = {m: 0 for m in self.markets}
         self.parse_logs = {m: False for m in self.markets}
+        if not SAVE_DIRECTORY:
+            os.mkdir('{} - {}'.format(START, END).replace('/', '.'))
+            self.save_directory = '{} - {}'.format(START, END).replace('/', '.')
         start_stamp = int(datetime.datetime.strptime(START, "%d/%m/%Y").timestamp())  # to unix timestamp pairs
         end_stamp = int(datetime.datetime.strptime(END, "%d/%m/%Y").timestamp())
         stamps = range(start_stamp, end_stamp, 3600)
@@ -62,12 +65,20 @@ class Collector:
                     print('Couldn\'t get proxy for {}. Trying again without proxy.'.format(market))
                     return self.get_trade_history(market, start, end)
 
+
+    """
+    require same length for all dat files, purging entries that are invalid
+    
+    """
+
     def parse(self, market):
         """calculate average bid/ask for given period from trade history and write it to file."""
-        reader = csv.reader(open('{}/RAW_{}.csv'.format(SAVE_DIRECTORY, market)))
-        writer = csv.writer(open('{}/{}.csv'.format(SAVE_DIRECTORY, market), 'a'))
+        reader = csv.reader(open('{}/RAW_{}.csv'.format(self.save_directory, market)))
+        writer = csv.writer(open('{}/{}.csv'.format(self.save_directory, market), 'a'))
         last_bid = None
         last_ask = None
+        last_tx = None
+        last_row_to_write = None
         row_to_write = []
         window = []
         while True:
@@ -77,6 +88,14 @@ class Collector:
                 typ = row[1]
                 rate = row[2]
                 amount = row[3]
+                '''
+                    if new tx > last tx + PERIOD, then we need to fill the book with a sufficient number of the
+                    previous row.
+                '''
+                if last_tx and last_row_to_write:
+                    for _ in range(int(round((tx - last_tx) / PERIOD))):
+                        if all(item is not None for item in last_row_to_write):
+                            writer.writerow(last_row_to_write)
                 if not window or tx < window[0][0] + PERIOD:  # variable period over which to take avg bid/ask
                     window.append((tx, typ, rate, amount))
                 else:
@@ -91,30 +110,33 @@ class Collector:
                     else:
                         ask = np.average([float(p[2]) for p in window if p[1] == 'buy'], weights=amts)
 
-                    if bid is None and last_bid is not None:
+                    if bid is None:
                         row_to_write.append(last_bid)
-                    elif bid is not None:
+                    else:
                         row_to_write.append(bid)
                         last_bid = bid
 
-                    if ask is None and last_ask is not None:
+                    if ask is None:
                         row_to_write.append(last_ask)
-                    elif bid is not None:
+                    else:
                         row_to_write.append(ask)
                         last_ask = ask
 
                     if len(row_to_write) == 2:
                         row_to_write.append(sum([float(v[3]) for v in window if v[1] == 'sell']))  # sell volume
                         row_to_write.append(sum([float(v[3]) for v in window if v[1] == 'buy']))  # buy volume
-                        writer.writerow(row_to_write)
+                        if all(item is not None for item in row_to_write):
+                            writer.writerow(row_to_write)
+                    last_row_to_write = row_to_write
                     row_to_write = []
                     window = [(tx, typ, rate, amount)]
+                    last_tx = tx
             except StopIteration:
                 break
 
     def worker(self, market):
         """ Thread collection of data from each individual market pair """
-        with open('{}/RAW_{}.csv'.format(SAVE_DIRECTORY, market), 'a') as f:
+        with open('{}/RAW_{}.csv'.format(self.save_directory, market), 'a') as f:
             writer = csv.writer(f)
             # start, stop represents an hour window to retrieve data for
             for start, stop in self.stamp_pairs:
@@ -124,7 +146,7 @@ class Collector:
                 self.download_logs[market] += 1  # for reporting download progress
         self.parse(market)
         self.parse_logs[market] = True
-        os.remove('{}/RAW_{}.csv'.format(SAVE_DIRECTORY, market))
+        os.remove('{}/RAW_{}.csv'.format(self.save_directory, market))
 
     def report(self):
         """ reports progress for each download / parse every 30 sec """
